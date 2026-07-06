@@ -11,6 +11,14 @@ import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
 
+from advisor import (
+    MARKET_INDICATORS,
+    build_allocation_frame,
+    build_diagnostics,
+    build_recommendations,
+    build_watchlist,
+    fetch_market_snapshot,
+)
 from portfolio_import import parse_portfolio_excel
 
 
@@ -74,6 +82,11 @@ def parse_date(value: str) -> str:
 
 def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_market_snapshot(tickers: tuple[str, ...]) -> tuple[pd.DataFrame, str | None]:
+    return fetch_market_snapshot(list(tickers))
 
 
 def parse_movement(line: str, page: int, source_file: str) -> dict[str, Any] | None:
@@ -263,6 +276,7 @@ except Exception as exc:
 subclasses = sorted(set(portfolio["sub_class_ips"].fillna("Non classificato").astype(str)) | set(DEFAULT_ASSUMPTIONS))
 assumptions = assumption_table(subclasses)
 summary = portfolio_summary(portfolio, assumptions)
+allocation = build_allocation_frame(portfolio, assumptions)
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Valore portafoglio", eur(summary["total"]), f"{len(portfolio)} posizioni")
@@ -270,7 +284,7 @@ col2.metric("P&L non realizzato", eur(summary["gain"]), pct(summary["gain_pct"])
 col3.metric("Reddito netto stimato", eur(summary["net_income"]), pct(summary["net_yield"]))
 col4.metric("Rendimento atteso", pct(summary["expected"]), f"Rischio {summary['risk']:.1f}/10")
 
-tabs = st.tabs(["Dashboard", "Allocazione", "Cedole & Dividendi", "Posizioni"])
+tabs = st.tabs(["Dashboard", "Advisor", "Mercati", "Allocazione", "Cedole & Dividendi", "Posizioni"])
 
 with tabs[0]:
     left, right = st.columns([1.1, 0.9])
@@ -297,15 +311,138 @@ with tabs[0]:
     st.dataframe(by_sub.rename("Valore EUR"), use_container_width=True)
 
 with tabs[1]:
-    current = portfolio.groupby("sub_class_ips", dropna=False)["market_value_eur"].sum().reset_index()
-    current.columns = ["Sottoclasse", "Valore"]
-    current["Peso attuale"] = current["Valore"] / summary["total"] if summary["total"] else 0
-    allocation = assumptions.merge(current, on="Sottoclasse", how="left").fillna({"Valore": 0, "Peso attuale": 0})
-    allocation["Drift vs target EUR"] = (allocation["target"] - allocation["Peso attuale"]) * summary["total"]
-    allocation["Stato"] = allocation.apply(
-        lambda row: "Sopra max" if row["Peso attuale"] > row["max"] else "Sotto min" if row["Peso attuale"] < row["min"] else "In banda",
-        axis=1,
+    st.subheader("Advisor decisionale")
+    st.caption("Motore rule-based: evidenzia priorità e scenari da valutare, senza sostituire una consulenza regolamentata.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    max_position_weight = c1.slider("Soglia posizione", min_value=3, max_value=20, value=8, step=1) / 100
+    home_bias_limit = c2.slider("Limite Italia", min_value=20, max_value=70, value=40, step=5) / 100
+    usd_limit = c3.slider("Limite USD", min_value=10, max_value=60, value=25, step=5) / 100
+    structured_limit = c4.slider("Limite structured", min_value=0, max_value=20, value=7, step=1) / 100
+
+    diagnostics = build_diagnostics(
+        portfolio,
+        allocation,
+        summary,
+        income_target,
+        max_position_weight=max_position_weight,
+        home_bias_limit=home_bias_limit,
+        usd_limit=usd_limit,
+        structured_limit=structured_limit,
     )
+    recommendations = build_recommendations(
+        portfolio,
+        allocation,
+        summary,
+        income_target,
+        max_position_weight=max_position_weight,
+    )
+    watchlist = build_watchlist(portfolio, allocation)
+
+    high_priority = int((diagnostics["Priorità"] == "Alta").sum()) if not diagnostics.empty else 0
+    medium_priority = int((diagnostics["Priorità"] == "Media").sum()) if not diagnostics.empty else 0
+    suggested_amount = float(recommendations["Importo indicativo"].sum()) if not recommendations.empty else 0.0
+
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Priorità alta", str(high_priority))
+    a2.metric("Priorità media", str(medium_priority))
+    a3.metric("Azioni suggerite", str(len(recommendations)))
+    a4.metric("Importo in esame", eur(suggested_amount))
+
+    st.subheader("Diagnosi")
+    if diagnostics.empty:
+        st.success("Nessuna criticità rilevante con le soglie correnti.")
+    else:
+        st.dataframe(diagnostics, use_container_width=True, hide_index=True)
+
+    st.subheader("Azioni suggerite")
+    if recommendations.empty:
+        st.info("Nessuna azione suggerita con le soglie correnti.")
+    else:
+        st.dataframe(
+            recommendations,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Importo indicativo": st.column_config.NumberColumn(format="€ %.0f"),
+            },
+        )
+
+    st.subheader("Watchlist investibile")
+    watchlist_display = watchlist.copy()
+    watchlist_display["Peso sottoclasse"] = watchlist_display["Peso sottoclasse"] * 100
+    st.dataframe(
+        watchlist_display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Valore già in portafoglio": st.column_config.NumberColumn(format="€ %.0f"),
+            "Peso sottoclasse": st.column_config.NumberColumn(format="%.1f%%"),
+        },
+    )
+
+with tabs[2]:
+    st.subheader("Monitor mercati")
+    st.caption("Dati pubblici via Yahoo Finance, usati come proxy di contesto. Non includono importi o dati personali.")
+
+    indicator_options = {item["ticker"]: f"{item['Nome']} ({item['ticker']})" for item in MARKET_INDICATORS}
+    default_indicators = [item["ticker"] for item in MARKET_INDICATORS[:9]]
+    selected_indicators = st.multiselect(
+        "Indicatori macro/mercato",
+        options=list(indicator_options),
+        default=default_indicators,
+        format_func=indicator_options.get,
+    )
+    include_portfolio_tickers = st.checkbox("Includi ticker quotati del portafoglio", value=True)
+    portfolio_tickers: list[str] = []
+    if include_portfolio_tickers and "ticker" in portfolio.columns:
+        portfolio_tickers = sorted(
+            {
+                str(ticker).strip()
+                for ticker in portfolio["ticker"].dropna().tolist()
+                if str(ticker).strip() and str(ticker).strip() != "-"
+            }
+        )
+
+    market_tickers = tuple(dict.fromkeys(selected_indicators + portfolio_tickers))
+    if not market_tickers:
+        st.info("Seleziona almeno un indicatore di mercato.")
+    else:
+        market_data, market_error = cached_market_snapshot(market_tickers)
+        if market_error:
+            st.warning(market_error)
+        if not market_data.empty:
+            market_labels = pd.DataFrame(MARKET_INDICATORS).rename(columns={"ticker": "ticker"})
+            market_data = market_data.merge(market_labels[["ticker", "Nome", "Area", "Tipo"]], on="ticker", how="left")
+            market_data["Nome"] = market_data["Nome"].fillna(market_data["ticker"])
+            market_data["Area"] = market_data["Area"].fillna("Portafoglio")
+            market_data["Tipo"] = market_data["Tipo"].fillna("Strumento")
+            market_data = market_data[["ticker", "Nome", "Area", "Tipo", "Ultimo", "1M", "3M", "YTD", "1Y", "Vol 3M ann.", "Trend 50g", "Aggiornato"]]
+            market_display = market_data.copy()
+            for column in ["1M", "3M", "YTD", "1Y", "Vol 3M ann.", "Trend 50g"]:
+                market_display[column] = market_display[column] * 100
+            st.dataframe(
+                market_display.sort_values(["Area", "Nome"]),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Ultimo": st.column_config.NumberColumn(format="%.2f"),
+                    "1M": st.column_config.NumberColumn(format="%.1f%%"),
+                    "3M": st.column_config.NumberColumn(format="%.1f%%"),
+                    "YTD": st.column_config.NumberColumn(format="%.1f%%"),
+                    "1Y": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Vol 3M ann.": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Trend 50g": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+            weak_markets = market_data[(market_data["3M"].fillna(0) < -0.08) | (market_data["Trend 50g"].fillna(0) < -0.05)]
+            strong_markets = market_data[(market_data["3M"].fillna(0) > 0.08) & (market_data["Trend 50g"].fillna(0) > 0.03)]
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Strumenti monitorati", str(len(market_data)))
+            m2.metric("Deboli / sotto trend", str(len(weak_markets)))
+            m3.metric("Forti / sopra trend", str(len(strong_markets)))
+
+with tabs[3]:
     allocation_display = allocation.copy()
     for column in ["Peso attuale", "min", "target", "max", "yield"]:
         allocation_display[column] = allocation_display[column] * 100
@@ -321,7 +458,7 @@ with tabs[1]:
         },
     )
 
-with tabs[2]:
+with tabs[4]:
     income_frames = []
     for uploaded_pdf in fineco_files:
         income_frames.append(parse_fineco_pdf(uploaded_pdf.getvalue(), uploaded_pdf.name))
@@ -348,7 +485,7 @@ with tabs[2]:
             use_container_width=True,
         )
 
-with tabs[3]:
+with tabs[5]:
     st.dataframe(
         portfolio.sort_values("market_value_eur", ascending=False),
         use_container_width=True,
