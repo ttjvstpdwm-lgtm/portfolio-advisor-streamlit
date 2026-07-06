@@ -11,6 +11,8 @@ import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
 
+from portfolio_import import parse_portfolio_excel
+
 
 st.set_page_config(
     page_title="Portfolio Advisor",
@@ -37,18 +39,6 @@ DEFAULT_ASSUMPTIONS = {
     "Structured / Leveraged ETF": {"min": 0.00, "target": 0.00, "max": 0.005, "yield": 0.000, "expected": -0.020, "risk": 10},
     "Cash": {"min": 0.01, "target": 0.03, "max": 0.08, "yield": 0.022, "expected": 0.020, "risk": 1},
 }
-
-NUMERIC_COLUMNS = [
-    "quantity",
-    "price",
-    "market_value_eur",
-    "portfolio_weight_pct",
-    "avg_cost",
-    "total_cost_eur",
-    "unrealized_gain_eur",
-    "unrealized_gain_pct",
-    "tax_rate_applicable_pct",
-]
 
 LINE_RE = re.compile(
     r"^(?P<operation_date>\d{2}\.\d{2}\.\d{2})\s+"
@@ -84,19 +74,6 @@ def parse_date(value: str) -> str:
 
 def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
-
-
-@st.cache_data(show_spinner=False)
-def parse_portfolio_excel(file_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Portfolio_Holdings_IPS")
-    df.columns = [str(column).strip() for column in df.columns]
-    df = df.dropna(how="all").copy()
-    for column in NUMERIC_COLUMNS:
-        if column in df.columns:
-            df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
-    total = float(df["market_value_eur"].sum())
-    df["computed_weight"] = df["market_value_eur"] / total if total else 0
-    return df
 
 
 def parse_movement(line: str, page: int, source_file: str) -> dict[str, Any] | None:
@@ -221,6 +198,7 @@ def portfolio_summary(df: pd.DataFrame, assumptions: pd.DataFrame) -> dict[str, 
     total = float(df["market_value_eur"].sum())
     cost = float(df["total_cost_eur"].sum())
     gain = float(df["unrealized_gain_eur"].sum())
+    accrued = float(df["accrued_interest_eur"].sum()) if "accrued_interest_eur" in df.columns else 0.0
     by_sub = df.groupby("sub_class_ips", dropna=False)["market_value_eur"].sum().reset_index()
     by_sub.columns = ["Sottoclasse", "Valore"]
     by_sub["Peso"] = by_sub["Valore"] / total if total else 0
@@ -244,6 +222,7 @@ def portfolio_summary(df: pd.DataFrame, assumptions: pd.DataFrame) -> dict[str, 
         "net_yield": net_income / total if total else 0,
         "expected": expected,
         "risk": risk,
+        "accrued": accrued,
     }
 
 
@@ -251,9 +230,9 @@ st.sidebar.title("Portfolio Advisor")
 st.sidebar.caption("App Streamlit deployabile via GitHub")
 
 portfolio_file = st.sidebar.file_uploader(
-    "Carica portfolio_holdings_IPS_ready.xlsx",
-    type=["xlsx"],
-    help="Il file resta nella sessione Streamlit. Non viene salvato nel repository.",
+    "Carica export portafoglio banca o IPS-ready",
+    type=["xls", "xlsx"],
+    help="Supporta l'export banca Portafoglio sintesi (.xls) e il workbook IPS-ready (.xlsx). Il file resta nella sessione Streamlit.",
 )
 
 fineco_files = st.sidebar.file_uploader(
@@ -271,7 +250,16 @@ if not portfolio_file:
     st.info("Carica il workbook Excel del portafoglio dalla barra laterale per iniziare.")
     st.stop()
 
-portfolio = parse_portfolio_excel(portfolio_file.getvalue())
+try:
+    portfolio = parse_portfolio_excel(portfolio_file.getvalue(), portfolio_file.name)
+except ValueError as exc:
+    st.error(str(exc))
+    st.stop()
+except Exception as exc:
+    st.error("Non riesco a leggere il file del portafoglio. Verifica che sia un export conto titoli o un workbook IPS-ready.")
+    st.caption(str(exc))
+    st.stop()
+
 subclasses = sorted(set(portfolio["sub_class_ips"].fillna("Non classificato").astype(str)) | set(DEFAULT_ASSUMPTIONS))
 assumptions = assumption_table(subclasses)
 summary = portfolio_summary(portfolio, assumptions)
@@ -294,6 +282,8 @@ with tabs[0]:
     with right:
         st.subheader("Priorità advisor")
         st.write(f"Reddito netto stimato: **{eur(summary['net_income'])}** su obiettivo **{eur(income_target)}**.")
+        if summary["accrued"]:
+            st.write(f"Ratei presenti nell'export: **{eur(summary['accrued'])}**.")
         if summary["net_income"] < income_target:
             st.warning(f"Gap reddito: {eur(summary['net_income'] - income_target)}")
         italy = portfolio[
