@@ -68,6 +68,26 @@ INVESTABLE_WATCHLIST = [
 ]
 
 
+HOT_TRADING_UNIVERSE = [
+    {"ticker": "AAPL", "Nome": "Apple", "Area": "Mega cap USA"},
+    {"ticker": "MSFT", "Nome": "Microsoft", "Area": "Mega cap USA"},
+    {"ticker": "NVDA", "Nome": "Nvidia", "Area": "Semiconduttori"},
+    {"ticker": "AMD", "Nome": "AMD", "Area": "Semiconduttori"},
+    {"ticker": "AVGO", "Nome": "Broadcom", "Area": "Semiconduttori"},
+    {"ticker": "GOOGL", "Nome": "Alphabet", "Area": "Mega cap USA"},
+    {"ticker": "META", "Nome": "Meta Platforms", "Area": "Mega cap USA"},
+    {"ticker": "TSLA", "Nome": "Tesla", "Area": "Alta volatilità"},
+    {"ticker": "NFLX", "Nome": "Netflix", "Area": "Consumer tech"},
+    {"ticker": "ASML.AS", "Nome": "ASML", "Area": "Europa tech"},
+    {"ticker": "SAP.DE", "Nome": "SAP", "Area": "Europa tech"},
+    {"ticker": "MC.PA", "Nome": "LVMH", "Area": "Europa consumer"},
+    {"ticker": "RACE.MI", "Nome": "Ferrari", "Area": "Italia quality"},
+    {"ticker": "ENEL.MI", "Nome": "Enel", "Area": "Italia difensivo"},
+    {"ticker": "LDO.MI", "Nome": "Leonardo", "Area": "Italia momentum"},
+    {"ticker": "STM.MI", "Nome": "STMicroelectronics", "Area": "Italia tech"},
+]
+
+
 def build_allocation_frame(portfolio: pd.DataFrame, assumptions: pd.DataFrame) -> pd.DataFrame:
     total = float(portfolio["market_value_eur"].sum())
     current = portfolio.groupby("sub_class_ips", dropna=False)["market_value_eur"].sum().reset_index()
@@ -383,6 +403,199 @@ def _historical_return(close: pd.Series, periods: int) -> float | None:
     if start == 0:
         return None
     return end / start - 1
+
+
+def _rsi(close: pd.Series, period: int = 14) -> float | None:
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = -delta.clip(upper=0).rolling(period).mean()
+    rs = gain / loss.replace(0, pd.NA)
+    rsi = 100 - (100 / (1 + rs))
+    clean = rsi.dropna()
+    if clean.empty:
+        return None
+    return float(clean.iloc[-1])
+
+
+def _bounded(value: float, lower: float, upper: float) -> float:
+    return min(max(value, lower), upper)
+
+
+def _hot_signal_from_history(
+    ticker: str,
+    name: str,
+    area: str,
+    history: pd.DataFrame,
+    budget_eur: float,
+    max_loss_pct: float,
+    max_positions: int,
+) -> dict[str, Any] | None:
+    if history is None or history.empty or "Close" not in history:
+        return None
+    close = history["Close"].dropna()
+    if len(close) < 70:
+        return None
+
+    returns = close.pct_change().dropna()
+    last = float(close.iloc[-1])
+    ma20 = float(close.rolling(20).mean().iloc[-1])
+    ma50 = float(close.rolling(50).mean().iloc[-1])
+    prev_high_20 = float(close.shift(1).rolling(20).max().iloc[-1])
+    prev_low_20 = float(close.shift(1).rolling(20).min().iloc[-1])
+    rsi = _rsi(close)
+    ret_5 = _historical_return(close, 5)
+    ret_20 = _historical_return(close, 20)
+    ret_60 = _historical_return(close, 60)
+
+    score = 0
+    reasons: list[str] = []
+
+    if last > ma20:
+        score += 12
+        reasons.append("prezzo sopra media 20g")
+    else:
+        score -= 12
+        reasons.append("prezzo sotto media 20g")
+
+    if ma20 > ma50:
+        score += 16
+        reasons.append("trend 20g sopra 50g")
+    else:
+        score -= 16
+        reasons.append("trend 20g sotto 50g")
+
+    if ret_20 is not None and ret_20 > 0:
+        score += 10
+        reasons.append("momentum 1M positivo")
+    elif ret_20 is not None:
+        score -= 10
+        reasons.append("momentum 1M negativo")
+
+    if ret_60 is not None and ret_60 > 0:
+        score += 8
+    elif ret_60 is not None:
+        score -= 8
+
+    if last >= prev_high_20 * 0.995:
+        score += 22
+        reasons.append("breakout area massimi 20g")
+    if last <= prev_low_20 * 1.005:
+        score -= 22
+        reasons.append("breakdown area minimi 20g")
+
+    if rsi is not None:
+        if 52 <= rsi <= 70:
+            score += 8
+            reasons.append("RSI costruttivo")
+        elif rsi < 40:
+            score -= 8
+            reasons.append("RSI debole")
+        elif rsi > 75:
+            score -= 10
+            reasons.append("RSI tirato")
+
+    if ret_5 is not None and ret_20 is not None and ret_5 < 0 < ret_20:
+        reasons.append("pullback dentro trend positivo")
+
+    if score >= 35:
+        direction = "Long"
+        signal = "BUY tecnico"
+    elif score <= -35:
+        direction = "Short/Avoid"
+        signal = "SELL/SHORT tecnico"
+    else:
+        direction = "No trade"
+        signal = "Neutrale"
+
+    abs_score = abs(score)
+    confidence = "Alta" if abs_score >= 65 else "Media" if abs_score >= 45 else "Bassa"
+    daily_vol = float(returns.tail(20).std()) if len(returns) >= 20 else 0.03
+    stop_pct = _bounded(2.2 * daily_vol * math.sqrt(5), 0.06, 0.18)
+    sleeve_loss_budget = budget_eur * max_loss_pct
+    risk_per_trade = sleeve_loss_budget / max(1, max_positions)
+    equal_weight_size = budget_eur / max(1, max_positions)
+    size_by_risk = risk_per_trade / stop_pct if stop_pct else equal_weight_size
+    suggested_size = 0.0 if direction == "No trade" else min(equal_weight_size, size_by_risk, budget_eur)
+
+    if direction == "Short/Avoid":
+        stop_price = last * (1 + stop_pct)
+        target_price = last * (1 - stop_pct * 1.5)
+    elif direction == "Long":
+        stop_price = last * (1 - stop_pct)
+        target_price = last * (1 + stop_pct * 1.5)
+    else:
+        stop_price = None
+        target_price = None
+
+    return {
+        "ticker": ticker,
+        "Nome": name,
+        "Area": area,
+        "Segnale": signal,
+        "Direzione": direction,
+        "Score": int(score),
+        "Confidenza": confidence,
+        "Ultimo": last,
+        "5D": ret_5,
+        "1M": ret_20,
+        "3M": ret_60,
+        "RSI 14": rsi,
+        "Vol 20g ann.": daily_vol * math.sqrt(252),
+        "Stop tecnico": stop_pct,
+        "Size max": suggested_size,
+        "Rischio stimato": suggested_size * stop_pct,
+        "Stop price": stop_price,
+        "Target tattico": target_price,
+        "Motivo": "; ".join(reasons[:4]),
+        "Aggiornato": str(close.index[-1].date()),
+    }
+
+
+def fetch_hot_trading_signals(
+    tickers: list[str],
+    portfolio_tickers: list[str],
+    budget_eur: float,
+    max_loss_pct: float,
+    max_positions: int,
+) -> tuple[pd.DataFrame, str | None]:
+    try:
+        import yfinance as yf
+    except Exception:
+        return pd.DataFrame(), "Per attivare Hot Trading installa la dipendenza yfinance."
+
+    universe_lookup = {item["ticker"].upper(): item for item in HOT_TRADING_UNIVERSE}
+    excluded = {ticker.upper() for ticker in portfolio_tickers if ticker}
+    unique_tickers = []
+    for ticker in tickers:
+        normalized = ticker.strip().upper()
+        if normalized and normalized not in excluded and normalized not in unique_tickers:
+            unique_tickers.append(normalized)
+
+    rows = []
+    for ticker in unique_tickers:
+        meta = universe_lookup.get(ticker, {"ticker": ticker, "Nome": ticker, "Area": "Custom"})
+        try:
+            history = yf.Ticker(ticker).history(period="6mo", auto_adjust=True)
+        except Exception:
+            continue
+        row = _hot_signal_from_history(
+            ticker=ticker,
+            name=str(meta["Nome"]),
+            area=str(meta["Area"]),
+            history=history,
+            budget_eur=budget_eur,
+            max_loss_pct=max_loss_pct,
+            max_positions=max_positions,
+        )
+        if row:
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(), "Non sono disponibili segnali Hot Trading in questo momento."
+
+    signals = pd.DataFrame(rows)
+    signals["_rank"] = signals["Score"].abs()
+    return signals.sort_values(["_rank", "Score"], ascending=[False, False]).drop(columns="_rank").reset_index(drop=True), None
 
 
 def fetch_market_snapshot(tickers: list[str]) -> tuple[pd.DataFrame, str | None]:

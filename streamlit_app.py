@@ -12,11 +12,13 @@ import streamlit as st
 from pypdf import PdfReader
 
 from advisor import (
+    HOT_TRADING_UNIVERSE,
     MARKET_INDICATORS,
     build_allocation_frame,
     build_diagnostics,
     build_recommendations,
     build_watchlist,
+    fetch_hot_trading_signals,
     fetch_market_snapshot,
 )
 from portfolio_import import parse_portfolio_excel
@@ -87,6 +89,17 @@ def clean_text(value: str) -> str:
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_market_snapshot(tickers: tuple[str, ...]) -> tuple[pd.DataFrame, str | None]:
     return fetch_market_snapshot(list(tickers))
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_hot_trading_signals(
+    tickers: tuple[str, ...],
+    portfolio_tickers: tuple[str, ...],
+    budget_eur: float,
+    max_loss_pct: float,
+    max_positions: int,
+) -> tuple[pd.DataFrame, str | None]:
+    return fetch_hot_trading_signals(list(tickers), list(portfolio_tickers), budget_eur, max_loss_pct, max_positions)
 
 
 def parse_movement(line: str, page: int, source_file: str) -> dict[str, Any] | None:
@@ -284,7 +297,7 @@ col2.metric("P&L non realizzato", eur(summary["gain"]), pct(summary["gain_pct"])
 col3.metric("Reddito netto stimato", eur(summary["net_income"]), pct(summary["net_yield"]))
 col4.metric("Rendimento atteso", pct(summary["expected"]), f"Rischio {summary['risk']:.1f}/10")
 
-tabs = st.tabs(["Dashboard", "Advisor", "Mercati", "Allocazione", "Cedole & Dividendi", "Posizioni"])
+tabs = st.tabs(["Dashboard", "Advisor", "Hot Trading", "Mercati", "Allocazione", "Cedole & Dividendi", "Posizioni"])
 
 with tabs[0]:
     left, right = st.columns([1.1, 0.9])
@@ -382,6 +395,103 @@ with tabs[1]:
     )
 
 with tabs[2]:
+    st.subheader("Hot Trading")
+    st.caption("Sleeve tattica separata dal portafoglio core. Segnali tecnici su titoli non in portafoglio, con perdita massima della sleeve impostabile.")
+
+    h1, h2, h3 = st.columns(3)
+    hot_budget = h1.slider("Budget Hot Trading", min_value=500, max_value=3000, value=2500, step=250)
+    hot_loss_pct = h2.slider("Perdita max sleeve", min_value=5, max_value=30, value=30, step=5) / 100
+    hot_positions = h3.slider("Numero max idee", min_value=1, max_value=5, value=3, step=1)
+
+    hot_loss_budget = hot_budget * hot_loss_pct
+    b1, b2, b3 = st.columns(3)
+    b1.metric("Budget sleeve", eur(float(hot_budget)))
+    b2.metric("Perdita massima", eur(float(hot_loss_budget)), pct(hot_loss_pct))
+    b3.metric("Rischio per idea", eur(float(hot_loss_budget / hot_positions)))
+
+    hot_labels = {item["ticker"]: f"{item['Nome']} ({item['ticker']})" for item in HOT_TRADING_UNIVERSE}
+    default_hot = [item["ticker"] for item in HOT_TRADING_UNIVERSE[:10]]
+    selected_hot = st.multiselect(
+        "Universo Hot Trading",
+        options=list(hot_labels),
+        default=default_hot,
+        format_func=hot_labels.get,
+    )
+    custom_hot = st.text_input("Ticker custom separati da virgola", value="")
+    custom_tickers = [ticker.strip().upper() for ticker in custom_hot.split(",") if ticker.strip()]
+
+    held_tickers: list[str] = []
+    if "ticker" in portfolio.columns:
+        held_tickers = sorted(
+            {
+                str(ticker).strip().upper()
+                for ticker in portfolio["ticker"].dropna().tolist()
+                if str(ticker).strip() and str(ticker).strip() != "-"
+            }
+        )
+    hot_tickers = tuple(dict.fromkeys(selected_hot + custom_tickers))
+    run_hot = st.toggle("Calcola segnali live", value=False)
+
+    if not run_hot:
+        st.info("Attiva il calcolo live per scaricare i dati e generare segnali tecnici.")
+    elif not hot_tickers:
+        st.info("Seleziona almeno un ticker per Hot Trading.")
+    else:
+        hot_signals, hot_error = cached_hot_trading_signals(hot_tickers, tuple(held_tickers), float(hot_budget), float(hot_loss_pct), int(hot_positions))
+        if hot_error:
+            st.warning(hot_error)
+        if not hot_signals.empty:
+            show_neutral = st.checkbox("Mostra anche segnali neutrali", value=False)
+            filtered_signals = hot_signals if show_neutral else hot_signals[hot_signals["Direzione"] != "No trade"]
+            if filtered_signals.empty:
+                st.info("Nessun segnale operativo forte con le soglie tecniche correnti.")
+            else:
+                hot_display = filtered_signals.copy()
+                for column in ["5D", "1M", "3M", "Vol 20g ann.", "Stop tecnico"]:
+                    hot_display[column] = hot_display[column] * 100
+                st.dataframe(
+                    hot_display[
+                        [
+                            "ticker",
+                            "Nome",
+                            "Area",
+                            "Segnale",
+                            "Direzione",
+                            "Score",
+                            "Confidenza",
+                            "Ultimo",
+                            "5D",
+                            "1M",
+                            "3M",
+                            "RSI 14",
+                            "Vol 20g ann.",
+                            "Stop tecnico",
+                            "Size max",
+                            "Rischio stimato",
+                            "Stop price",
+                            "Target tattico",
+                            "Motivo",
+                            "Aggiornato",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Ultimo": st.column_config.NumberColumn(format="%.2f"),
+                        "5D": st.column_config.NumberColumn(format="%.1f%%"),
+                        "1M": st.column_config.NumberColumn(format="%.1f%%"),
+                        "3M": st.column_config.NumberColumn(format="%.1f%%"),
+                        "RSI 14": st.column_config.NumberColumn(format="%.1f"),
+                        "Vol 20g ann.": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Stop tecnico": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Size max": st.column_config.NumberColumn(format="€ %.0f"),
+                        "Rischio stimato": st.column_config.NumberColumn(format="€ %.0f"),
+                        "Stop price": st.column_config.NumberColumn(format="%.2f"),
+                        "Target tattico": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+
+with tabs[3]:
     st.subheader("Monitor mercati")
     st.caption("Dati pubblici via Yahoo Finance, usati come proxy di contesto. Non includono importi o dati personali.")
 
@@ -405,7 +515,10 @@ with tabs[2]:
         )
 
     market_tickers = tuple(dict.fromkeys(selected_indicators + portfolio_tickers))
-    if not market_tickers:
+    run_market = st.toggle("Aggiorna monitor mercati live", value=False)
+    if not run_market:
+        st.info("Attiva il monitor live per scaricare dati di mercato aggiornati.")
+    elif not market_tickers:
         st.info("Seleziona almeno un indicatore di mercato.")
     else:
         market_data, market_error = cached_market_snapshot(market_tickers)
@@ -442,7 +555,7 @@ with tabs[2]:
             m2.metric("Deboli / sotto trend", str(len(weak_markets)))
             m3.metric("Forti / sopra trend", str(len(strong_markets)))
 
-with tabs[3]:
+with tabs[4]:
     allocation_display = allocation.copy()
     for column in ["Peso attuale", "min", "target", "max", "yield"]:
         allocation_display[column] = allocation_display[column] * 100
@@ -458,7 +571,7 @@ with tabs[3]:
         },
     )
 
-with tabs[4]:
+with tabs[5]:
     income_frames = []
     for uploaded_pdf in fineco_files:
         income_frames.append(parse_fineco_pdf(uploaded_pdf.getvalue(), uploaded_pdf.name))
@@ -485,7 +598,7 @@ with tabs[4]:
             use_container_width=True,
         )
 
-with tabs[5]:
+with tabs[6]:
     st.dataframe(
         portfolio.sort_values("market_value_eur", ascending=False),
         use_container_width=True,
