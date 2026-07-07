@@ -12,16 +12,28 @@ import streamlit as st
 from pypdf import PdfReader
 
 from advisor import (
-    HOT_TRADING_UNIVERSE,
     MARKET_INDICATORS,
     build_allocation_frame,
     build_diagnostics,
     build_recommendations,
     build_watchlist,
-    fetch_hot_trading_signals,
     fetch_market_snapshot,
 )
 from portfolio_import import parse_portfolio_excel
+
+try:
+    from advisor import HOT_TRADING_UNIVERSE, fetch_hot_trading_signals
+except ImportError:
+    HOT_TRADING_UNIVERSE = []
+
+    def fetch_hot_trading_signals(
+        tickers: list[str],
+        portfolio_tickers: list[str],
+        budget_eur: float,
+        max_loss_pct: float,
+        max_positions: int,
+    ) -> tuple[pd.DataFrame, str | None]:
+        return pd.DataFrame(), "Hot Trading non disponibile: attendi il redeploy completo di Streamlit Cloud."
 
 
 st.set_page_config(
