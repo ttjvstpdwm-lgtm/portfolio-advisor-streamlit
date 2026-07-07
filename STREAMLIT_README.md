@@ -12,7 +12,7 @@ The bank export is normalized at runtime into the app's internal portfolio schem
 
 The Advisor tab is rule-based and explainable: it highlights IPS breaches, concentration, home bias, currency exposure, structured/leveraged exposure, income gaps, and positions whose thesis should be reviewed. The Mercati tab uses public Yahoo Finance data as market context.
 
-The Hot Trading tab is a separate tactical sleeve for small short-term experiments. It excludes current portfolio tickers, ranks technical buy/sell-short signals, and sizes ideas against a user-defined budget and maximum sleeve loss.
+The Hot Trading tab is a separate tactical sleeve for small short-term experiments. It excludes current portfolio tickers, filters by price, liquidity, turnover, volatility, score, and signal type, ranks technical buy/sell-short signals, and sizes ideas against a user-defined budget and maximum sleeve loss.
 
 ## Privacy
 

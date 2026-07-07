@@ -110,8 +110,28 @@ def cached_hot_trading_signals(
     budget_eur: float,
     max_loss_pct: float,
     max_positions: int,
+    min_price: float,
+    min_avg_volume: float,
+    min_turnover: float,
+    min_annual_vol: float,
+    max_annual_vol: float,
+    min_abs_score: int,
+    signal_filter: str,
 ) -> tuple[pd.DataFrame, str | None]:
-    return fetch_hot_trading_signals(list(tickers), list(portfolio_tickers), budget_eur, max_loss_pct, max_positions)
+    return fetch_hot_trading_signals(
+        list(tickers),
+        list(portfolio_tickers),
+        budget_eur,
+        max_loss_pct,
+        max_positions,
+        min_price=min_price,
+        min_avg_volume=min_avg_volume,
+        min_turnover=min_turnover,
+        min_annual_vol=min_annual_vol,
+        max_annual_vol=max_annual_vol,
+        min_abs_score=min_abs_score,
+        signal_filter=signal_filter,
+    )
 
 
 def parse_movement(line: str, page: int, source_file: str) -> dict[str, Any] | None:
@@ -432,6 +452,21 @@ with tabs[2]:
     custom_hot = st.text_input("Ticker custom separati da virgola", value="")
     custom_tickers = [ticker.strip().upper() for ticker in custom_hot.split(",") if ticker.strip()]
 
+    with st.expander("Filtri robustezza", expanded=True):
+        f1, f2, f3 = st.columns(3)
+        min_price = f1.number_input("Prezzo minimo", min_value=0.0, value=5.0, step=1.0)
+        min_avg_volume = f2.number_input("Volume medio minimo 20g", min_value=0, value=250000, step=50000)
+        min_turnover_mln = f3.number_input("Controvalore minimo 20g", min_value=0.0, value=2.5, step=0.5, help="Milioni nella valuta di quotazione.")
+        f4, f5, f6 = st.columns(3)
+        min_annual_vol = f4.slider("Volatilità annua minima", min_value=0, max_value=100, value=15, step=5) / 100
+        max_annual_vol = f5.slider("Volatilità annua massima", min_value=20, max_value=250, value=120, step=10) / 100
+        min_abs_score = f6.slider("Score minimo assoluto", min_value=0, max_value=90, value=35, step=5)
+        signal_filter = st.radio(
+            "Tipo segnali",
+            options=["Operativi", "Solo BUY", "Solo SELL/SHORT", "Tutti"],
+            horizontal=True,
+        )
+
     held_tickers: list[str] = []
     if "ticker" in portfolio.columns:
         held_tickers = sorted(
@@ -449,11 +484,24 @@ with tabs[2]:
     elif not hot_tickers:
         st.info("Seleziona almeno un ticker per Hot Trading.")
     else:
-        hot_signals, hot_error = cached_hot_trading_signals(hot_tickers, tuple(held_tickers), float(hot_budget), float(hot_loss_pct), int(hot_positions))
+        hot_signals, hot_error = cached_hot_trading_signals(
+            hot_tickers,
+            tuple(held_tickers),
+            float(hot_budget),
+            float(hot_loss_pct),
+            int(hot_positions),
+            float(min_price),
+            float(min_avg_volume),
+            float(min_turnover_mln * 1_000_000),
+            float(min_annual_vol),
+            float(max_annual_vol),
+            int(min_abs_score),
+            signal_filter,
+        )
         if hot_error:
             st.warning(hot_error)
         if not hot_signals.empty:
-            show_neutral = st.checkbox("Mostra anche segnali neutrali", value=False)
+            show_neutral = signal_filter == "Tutti"
             filtered_signals = hot_signals if show_neutral else hot_signals[hot_signals["Direzione"] != "No trade"]
             if filtered_signals.empty:
                 st.info("Nessun segnale operativo forte con le soglie tecniche correnti.")
@@ -477,6 +525,8 @@ with tabs[2]:
                             "3M",
                             "RSI 14",
                             "Vol 20g ann.",
+                            "Volume medio 20g",
+                            "Controvalore 20g",
                             "Stop tecnico",
                             "Size max",
                             "Rischio stimato",
@@ -495,6 +545,8 @@ with tabs[2]:
                         "3M": st.column_config.NumberColumn(format="%.1f%%"),
                         "RSI 14": st.column_config.NumberColumn(format="%.1f"),
                         "Vol 20g ann.": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Volume medio 20g": st.column_config.NumberColumn(format="%.0f"),
+                        "Controvalore 20g": st.column_config.NumberColumn(format="%.0f"),
                         "Stop tecnico": st.column_config.NumberColumn(format="%.1f%%"),
                         "Size max": st.column_config.NumberColumn(format="€ %.0f"),
                         "Rischio stimato": st.column_config.NumberColumn(format="€ %.0f"),

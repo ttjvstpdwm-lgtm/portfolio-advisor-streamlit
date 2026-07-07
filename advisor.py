@@ -429,8 +429,13 @@ def _hot_signal_from_history(
     budget_eur: float,
     max_loss_pct: float,
     max_positions: int,
+    min_price: float,
+    min_avg_volume: float,
+    min_turnover: float,
+    min_annual_vol: float,
+    max_annual_vol: float,
 ) -> dict[str, Any] | None:
-    if history is None or history.empty or "Close" not in history:
+    if history is None or history.empty or "Close" not in history or "Volume" not in history:
         return None
     close = history["Close"].dropna()
     if len(close) < 70:
@@ -438,6 +443,14 @@ def _hot_signal_from_history(
 
     returns = close.pct_change().dropna()
     last = float(close.iloc[-1])
+    avg_volume_20 = float(history["Volume"].tail(20).mean())
+    turnover_20 = avg_volume_20 * last
+    annual_vol = float(returns.tail(20).std() * math.sqrt(252)) if len(returns) >= 20 else 0.0
+    if last < min_price or avg_volume_20 < min_avg_volume or turnover_20 < min_turnover:
+        return None
+    if annual_vol < min_annual_vol or annual_vol > max_annual_vol:
+        return None
+
     ma20 = float(close.rolling(20).mean().iloc[-1])
     ma50 = float(close.rolling(50).mean().iloc[-1])
     prev_high_20 = float(close.shift(1).rolling(20).max().iloc[-1])
@@ -540,7 +553,9 @@ def _hot_signal_from_history(
         "1M": ret_20,
         "3M": ret_60,
         "RSI 14": rsi,
-        "Vol 20g ann.": daily_vol * math.sqrt(252),
+        "Vol 20g ann.": annual_vol,
+        "Volume medio 20g": avg_volume_20,
+        "Controvalore 20g": turnover_20,
         "Stop tecnico": stop_pct,
         "Size max": suggested_size,
         "Rischio stimato": suggested_size * stop_pct,
@@ -557,6 +572,13 @@ def fetch_hot_trading_signals(
     budget_eur: float,
     max_loss_pct: float,
     max_positions: int,
+    min_price: float = 5.0,
+    min_avg_volume: float = 250000.0,
+    min_turnover: float = 2500000.0,
+    min_annual_vol: float = 0.15,
+    max_annual_vol: float = 1.20,
+    min_abs_score: int = 35,
+    signal_filter: str = "Operativi",
 ) -> tuple[pd.DataFrame, str | None]:
     try:
         import yfinance as yf
@@ -586,6 +608,11 @@ def fetch_hot_trading_signals(
             budget_eur=budget_eur,
             max_loss_pct=max_loss_pct,
             max_positions=max_positions,
+            min_price=min_price,
+            min_avg_volume=min_avg_volume,
+            min_turnover=min_turnover,
+            min_annual_vol=min_annual_vol,
+            max_annual_vol=max_annual_vol,
         )
         if row:
             rows.append(row)
@@ -594,6 +621,18 @@ def fetch_hot_trading_signals(
         return pd.DataFrame(), "Non sono disponibili segnali Hot Trading in questo momento."
 
     signals = pd.DataFrame(rows)
+    if signal_filter == "Solo BUY":
+        signals = signals[signals["Direzione"] == "Long"].copy()
+    elif signal_filter == "Solo SELL/SHORT":
+        signals = signals[signals["Direzione"] == "Short/Avoid"].copy()
+    elif signal_filter == "Operativi":
+        signals = signals[signals["Direzione"] != "No trade"].copy()
+
+    if signal_filter != "Tutti":
+        signals = signals[signals["Score"].abs() >= min_abs_score].copy()
+    if signals.empty:
+        return pd.DataFrame(), "Nessun titolo supera i filtri Hot Trading correnti."
+
     signals["_rank"] = signals["Score"].abs()
     return signals.sort_values(["_rank", "Score"], ascending=[False, False]).drop(columns="_rank").reset_index(drop=True), None
 
