@@ -3,7 +3,13 @@ import unittest
 
 import pandas as pd
 
-from account_movements import parse_current_account_excel
+from account_movements import (
+    category_outflows,
+    monthly_cashflow,
+    movement_kpis,
+    parse_current_account_excel,
+    top_movements,
+)
 
 
 class AccountMovementsImportTest(unittest.TestCase):
@@ -83,7 +89,24 @@ class AccountMovementsImportTest(unittest.TestCase):
         self.assertAlmostEqual(float(saipem["Ritenuta"]), 132.60)
         self.assertAlmostEqual(float(saipem["Tax rate"]), 0.26)
 
+        kpis = movement_kpis(movements)
+        self.assertEqual(kpis["movement_count"], 4)
+        self.assertAlmostEqual(kpis["inflows"], 694.03)
+        self.assertAlmostEqual(kpis["outflows"], 155.61)
+        self.assertAlmostEqual(kpis["net_cashflow"], 538.42)
+        self.assertAlmostEqual(kpis["operating_outflows"], 155.61)
+        self.assertAlmostEqual(kpis["non_operating_outflows"], 0.0)
+
+        monthly = monthly_cashflow(movements)
+        self.assertEqual(len(monthly), 1)
+        self.assertAlmostEqual(float(monthly.iloc[0]["Saldo netto"]), 538.42)
+
+        categories = category_outflows(movements)
+        self.assertIn("Tasse e tributi", categories["Categoria"].tolist())
+
+        self.assertEqual(top_movements(movements, "out", n=1).iloc[0]["Uscite"], -132.60)
+        self.assertEqual(top_movements(movements, "in", n=1).iloc[0]["Entrate"], 510.00)
+
 
 if __name__ == "__main__":
     unittest.main()
-

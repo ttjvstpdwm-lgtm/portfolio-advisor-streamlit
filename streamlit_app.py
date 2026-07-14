@@ -19,7 +19,13 @@ from advisor import (
     build_watchlist,
     fetch_market_snapshot,
 )
-from account_movements import parse_current_account_excel
+from account_movements import (
+    category_outflows,
+    monthly_cashflow,
+    movement_kpis,
+    parse_current_account_excel,
+    top_movements,
+)
 from portfolio_import import parse_portfolio_excel
 
 try:
@@ -133,6 +139,11 @@ def cached_hot_trading_signals(
         min_abs_score=min_abs_score,
         signal_filter=signal_filter,
     )
+
+
+@st.cache_data(show_spinner=False)
+def cached_current_account_excel(file_bytes: bytes, file_name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    return parse_current_account_excel(file_bytes, file_name)
 
 
 def parse_movement(line: str, page: int, source_file: str) -> dict[str, Any] | None:
@@ -285,6 +296,142 @@ def portfolio_summary(df: pd.DataFrame, assumptions: pd.DataFrame) -> dict[str, 
     }
 
 
+def render_current_account_dashboard(
+    movements: pd.DataFrame,
+    movement_errors: list[str],
+) -> None:
+    st.subheader("Dashboard conto corrente")
+    st.caption("KPI calcolati sui movimenti conto corrente caricati dalla sidebar.")
+
+    if movement_errors:
+        with st.expander("File movimenti non letti"):
+            for error in movement_errors:
+                st.warning(error)
+
+    if movements.empty:
+        st.info("Carica uno o più Excel movimenti conto corrente nella barra laterale per vedere i KPI.")
+        return
+
+    kpis = movement_kpis(movements)
+    st.caption(f"Periodo: {kpis['start_date']} - {kpis['end_date']} | Mesi rilevati: {kpis['months']}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Entrate", eur(float(kpis["inflows"])))
+    c2.metric("Uscite", eur(float(kpis["outflows"])))
+    c3.metric("Saldo netto", eur(float(kpis["net_cashflow"])))
+    c4.metric("Savings rate", pct(float(kpis["savings_rate"])) if kpis["savings_rate"] is not None else "n.d.")
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Spesa operativa", eur(float(kpis["operating_outflows"])))
+    c6.metric("Saldo medio mese", eur(float(kpis["avg_monthly_net"])))
+    c7.metric("Movimenti", str(kpis["movement_count"]))
+    c8.metric("Non categorizzati", str(kpis["uncategorized_count"]))
+
+    if kpis["card_outflows"]:
+        st.info(
+            f"Pagamenti carta nel conto: {eur(float(kpis['card_outflows']))}. "
+            "Nel file conto corrente sono riepilogati come addebiti carta, non come singole spese carta."
+        )
+    if kpis["non_operating_outflows"]:
+        st.caption(
+            f"Movimenti esclusi dalla vista categorie operativa: {eur(float(kpis['non_operating_outflows']))} "
+            "(giroconti, investimenti e movimenti titoli)."
+        )
+
+    include_internal = st.checkbox(
+        "Includi giroconti e investimenti nelle categorie di spesa",
+        value=False,
+        help="Disattivato: la vista categorie prova a mostrare la spesa operativa, escludendo giroconti e investimenti.",
+    )
+
+    monthly = monthly_cashflow(movements)
+    categories = category_outflows(movements, exclude_internal=not include_internal)
+
+    left, right = st.columns([1.1, 0.9])
+    with left:
+        st.subheader("Trend mensile")
+        if monthly.empty:
+            st.info("Nessun movimento mensile disponibile.")
+        else:
+            st.bar_chart(monthly.set_index("Mese")[["Entrate", "Uscite", "Saldo netto"]])
+            st.dataframe(
+                monthly,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Entrate": st.column_config.NumberColumn(format="€ %.2f"),
+                    "Uscite": st.column_config.NumberColumn(format="€ %.2f"),
+                    "Saldo netto": st.column_config.NumberColumn(format="€ %.2f"),
+                },
+            )
+
+    with right:
+        st.subheader("Uscite per categoria")
+        if categories.empty:
+            st.info("Nessuna uscita categorizzata.")
+        else:
+            top_categories = categories.head(12)
+            st.bar_chart(top_categories.set_index("Categoria")["Uscite"])
+            st.dataframe(
+                top_categories,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Uscite": st.column_config.NumberColumn(format="€ %.2f"),
+                    "Movimenti": st.column_config.NumberColumn(format="%d"),
+                },
+            )
+
+    outflows, inflows = st.columns(2)
+    with outflows:
+        st.subheader("Top uscite")
+        top_out = top_movements(movements, "out", n=12)
+        if top_out.empty:
+            st.info("Nessuna uscita disponibile.")
+        else:
+            st.dataframe(
+                top_out[
+                    [
+                        "Data operazione",
+                        "Importo assoluto",
+                        "Descrizione",
+                        "Descrizione completa",
+                        "Moneymap",
+                        "Fonte",
+                    ]
+                ],
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Importo assoluto": st.column_config.NumberColumn("Importo", format="€ %.2f"),
+                },
+            )
+
+    with inflows:
+        st.subheader("Top entrate")
+        top_in = top_movements(movements, "in", n=12)
+        if top_in.empty:
+            st.info("Nessuna entrata disponibile.")
+        else:
+            st.dataframe(
+                top_in[
+                    [
+                        "Data operazione",
+                        "Importo assoluto",
+                        "Descrizione",
+                        "Descrizione completa",
+                        "Moneymap",
+                        "Fonte",
+                    ]
+                ],
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Importo assoluto": st.column_config.NumberColumn("Importo", format="€ %.2f"),
+                },
+            )
+
+
 st.sidebar.title("Portfolio Advisor")
 st.sidebar.caption("App Streamlit deployabile via GitHub")
 
@@ -325,13 +472,28 @@ assumptions = assumption_table(subclasses)
 summary = portfolio_summary(portfolio, assumptions)
 allocation = build_allocation_frame(portfolio, assumptions)
 
+income_frames = []
+movement_frames = []
+movement_errors = []
+for uploaded_excel in movement_files:
+    try:
+        income_frame, movement_frame = cached_current_account_excel(uploaded_excel.getvalue(), uploaded_excel.name)
+        if not income_frame.empty:
+            income_frames.append(income_frame)
+        movement_frames.append(movement_frame)
+    except Exception as exc:
+        movement_errors.append(f"{uploaded_excel.name}: {exc}")
+
+income = pd.concat(income_frames, ignore_index=True).drop_duplicates("ID") if income_frames else pd.DataFrame()
+movements = pd.concat(movement_frames, ignore_index=True) if movement_frames else pd.DataFrame()
+
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Valore portafoglio", eur(summary["total"]), f"{len(portfolio)} posizioni")
 col2.metric("P&L non realizzato", eur(summary["gain"]), pct(summary["gain_pct"]))
 col3.metric("Reddito netto stimato", eur(summary["net_income"]), pct(summary["net_yield"]))
 col4.metric("Rendimento atteso", pct(summary["expected"]), f"Rischio {summary['risk']:.1f}/10")
 
-tabs = st.tabs(["Dashboard", "Advisor", "Hot Trading", "Mercati", "Allocazione", "Cedole & Dividendi", "Posizioni"])
+tabs = st.tabs(["Dashboard", "Advisor", "Hot Trading", "Mercati", "Allocazione", "Conto Corrente", "Cedole & Dividendi", "Posizioni"])
 
 with tabs[0]:
     left, right = st.columns([1.1, 0.9])
@@ -638,20 +800,9 @@ with tabs[4]:
     )
 
 with tabs[5]:
-    income_frames = []
-    movement_frames = []
-    for uploaded_excel in movement_files:
-        try:
-            income_frame, movement_frame = parse_current_account_excel(uploaded_excel.getvalue(), uploaded_excel.name)
-            if not income_frame.empty:
-                income_frames.append(income_frame)
-            movement_frames.append(movement_frame)
-        except Exception as exc:
-            st.warning(f"Non riesco a leggere {uploaded_excel.name}: {exc}")
+    render_current_account_dashboard(movements, movement_errors)
 
-    income = pd.concat(income_frames, ignore_index=True).drop_duplicates("ID") if income_frames else pd.DataFrame()
-    movements = pd.concat(movement_frames, ignore_index=True) if movement_frames else pd.DataFrame()
-
+with tabs[6]:
     if income.empty:
         st.info("Carica uno o più Excel movimenti conto corrente nella barra laterale per vedere il consuntivo cedole/dividendi.")
     else:
@@ -701,7 +852,7 @@ with tabs[5]:
                 },
             )
 
-with tabs[6]:
+with tabs[7]:
     st.dataframe(
         portfolio.sort_values("market_value_eur", ascending=False),
         use_container_width=True,

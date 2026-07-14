@@ -271,3 +271,128 @@ def build_income_events(components: list[dict[str, Any]]) -> pd.DataFrame:
         events.append(event)
 
     return pd.DataFrame(events).drop_duplicates("ID")
+
+
+def movement_kpis(movements: pd.DataFrame) -> dict[str, Any]:
+    if movements.empty:
+        return {
+            "start_date": None,
+            "end_date": None,
+            "months": 0,
+            "movement_count": 0,
+            "inflows": 0.0,
+            "outflows": 0.0,
+            "net_cashflow": 0.0,
+            "avg_monthly_outflows": 0.0,
+            "operating_outflows": 0.0,
+            "avg_monthly_operating_outflows": 0.0,
+            "non_operating_outflows": 0.0,
+            "avg_monthly_net": 0.0,
+            "savings_rate": None,
+            "uncategorized_count": 0,
+            "card_outflows": 0.0,
+            "internal_transfers": 0.0,
+        }
+
+    data = movements.copy()
+    dates = pd.to_datetime(data["Data operazione"], errors="coerce")
+    month_count = max(1, int(dates.dt.to_period("M").nunique()))
+    inflows = float(data["Entrate"].clip(lower=0).sum())
+    outflows = float(data["Uscite"].clip(upper=0).abs().sum())
+    net_cashflow = inflows - outflows
+    card_mask = data["Descrizione"].astype(str).str.contains("Utilizzo carta", case=False, na=False)
+    transfer_mask = data["Descrizione"].astype(str).str.contains("Giroconto", case=False, na=False)
+    non_operating_mask = non_operating_movement_mask(data)
+    uncategorized = data["Moneymap"].astype(str).str.strip().eq("")
+    operating_outflows = float(data.loc[(data["Uscite"] < 0) & ~non_operating_mask, "Uscite"].abs().sum())
+    non_operating_outflows = float(data.loc[(data["Uscite"] < 0) & non_operating_mask, "Uscite"].abs().sum())
+
+    return {
+        "start_date": dates.min().date().isoformat() if dates.notna().any() else None,
+        "end_date": dates.max().date().isoformat() if dates.notna().any() else None,
+        "months": month_count,
+        "movement_count": int(len(data)),
+        "inflows": inflows,
+        "outflows": outflows,
+        "net_cashflow": net_cashflow,
+        "avg_monthly_outflows": outflows / month_count,
+        "operating_outflows": operating_outflows,
+        "avg_monthly_operating_outflows": operating_outflows / month_count,
+        "non_operating_outflows": non_operating_outflows,
+        "avg_monthly_net": net_cashflow / month_count,
+        "savings_rate": net_cashflow / inflows if inflows else None,
+        "uncategorized_count": int(uncategorized.sum()),
+        "card_outflows": float(data.loc[card_mask, "Uscite"].clip(upper=0).abs().sum()),
+        "internal_transfers": float(data.loc[transfer_mask, "Uscite"].clip(upper=0).abs().sum()),
+    }
+
+
+def monthly_cashflow(movements: pd.DataFrame) -> pd.DataFrame:
+    if movements.empty:
+        return pd.DataFrame(columns=["Mese", "Entrate", "Uscite", "Saldo netto"])
+
+    data = movements.copy()
+    data["Mese"] = pd.to_datetime(data["Data operazione"], errors="coerce").dt.to_period("M").astype(str)
+    monthly = (
+        data.groupby("Mese", dropna=False)
+        .agg(Entrate=("Entrate", "sum"), Uscite=("Uscite", "sum"))
+        .reset_index()
+        .sort_values("Mese")
+    )
+    monthly["Uscite"] = monthly["Uscite"].abs()
+    monthly["Saldo netto"] = monthly["Entrate"] - monthly["Uscite"]
+    return monthly
+
+
+def category_outflows(
+    movements: pd.DataFrame,
+    exclude_internal: bool = True,
+) -> pd.DataFrame:
+    if movements.empty:
+        return pd.DataFrame(columns=["Categoria", "Uscite", "Movimenti"])
+
+    data = movements[movements["Uscite"] < 0].copy()
+    if exclude_internal:
+        data = data[~non_operating_movement_mask(data)].copy()
+
+    data["Categoria"] = data["Moneymap"].replace("", "Non categorizzato").fillna("Non categorizzato")
+    result = (
+        data.groupby("Categoria", dropna=False)
+        .agg(Uscite=("Uscite", lambda values: float(values.abs().sum())), Movimenti=("Uscite", "size"))
+        .reset_index()
+        .sort_values("Uscite", ascending=False)
+    )
+    return result
+
+
+def non_operating_movement_mask(movements: pd.DataFrame) -> pd.Series:
+    if movements.empty:
+        return pd.Series(dtype=bool)
+    text = (
+        movements["Descrizione"].fillna("").astype(str)
+        + " "
+        + movements["Descrizione completa"].fillna("").astype(str)
+    ).str.casefold()
+    moneymap = movements["Moneymap"].fillna("").astype(str).str.casefold()
+    return (
+        text.str.contains("giroconto|compravendita titoli|storno movimento titoli|movimento titoli", regex=True)
+        | moneymap.isin({"investimenti"})
+    )
+
+
+def top_movements(
+    movements: pd.DataFrame,
+    direction: str,
+    n: int = 10,
+) -> pd.DataFrame:
+    if movements.empty:
+        return pd.DataFrame()
+
+    if direction == "out":
+        data = movements[movements["Uscite"] < 0].copy()
+        data["Importo assoluto"] = data["Uscite"].abs()
+    else:
+        data = movements[movements["Entrate"] > 0].copy()
+        data["Importo assoluto"] = data["Entrate"].abs()
+
+    return data.sort_values("Importo assoluto", ascending=False).head(n)
