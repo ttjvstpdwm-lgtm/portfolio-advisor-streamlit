@@ -19,6 +19,7 @@ from advisor import (
     build_watchlist,
     fetch_market_snapshot,
 )
+from account_movements import parse_current_account_excel
 from portfolio_import import parse_portfolio_excel
 
 try:
@@ -293,10 +294,11 @@ portfolio_file = st.sidebar.file_uploader(
     help="Supporta l'export banca Portafoglio sintesi (.xls) e il workbook IPS-ready (.xlsx). Il file resta nella sessione Streamlit.",
 )
 
-fineco_files = st.sidebar.file_uploader(
-    "Carica estratti Fineco PDF",
-    type=["pdf"],
+movement_files = st.sidebar.file_uploader(
+    "Carica movimenti conto corrente Excel",
+    type=["xls", "xlsx"],
     accept_multiple_files=True,
+    help="Carica l'export movimenti conto corrente Fineco. L'app estrae cedole, dividendi, interessi e ritenute dal file completo dei movimenti.",
 )
 
 income_target = st.sidebar.number_input("Obiettivo netto annuo", min_value=0, step=500, value=18000)
@@ -637,12 +639,21 @@ with tabs[4]:
 
 with tabs[5]:
     income_frames = []
-    for uploaded_pdf in fineco_files:
-        income_frames.append(parse_fineco_pdf(uploaded_pdf.getvalue(), uploaded_pdf.name))
+    movement_frames = []
+    for uploaded_excel in movement_files:
+        try:
+            income_frame, movement_frame = parse_current_account_excel(uploaded_excel.getvalue(), uploaded_excel.name)
+            if not income_frame.empty:
+                income_frames.append(income_frame)
+            movement_frames.append(movement_frame)
+        except Exception as exc:
+            st.warning(f"Non riesco a leggere {uploaded_excel.name}: {exc}")
+
     income = pd.concat(income_frames, ignore_index=True).drop_duplicates("ID") if income_frames else pd.DataFrame()
+    movements = pd.concat(movement_frames, ignore_index=True) if movement_frames else pd.DataFrame()
 
     if income.empty:
-        st.info("Carica uno o più PDF Fineco nella barra laterale per vedere il consuntivo cedole/dividendi.")
+        st.info("Carica uno o più Excel movimenti conto corrente nella barra laterale per vedere il consuntivo cedole/dividendi.")
     else:
         income["Data pagamento"] = pd.to_datetime(income["Data pagamento"])
         selected_year = int(income["Data pagamento"].dt.year.max())
@@ -661,6 +672,34 @@ with tabs[5]:
             ],
             use_container_width=True,
         )
+
+    if not movements.empty:
+        with st.expander("Movimenti conto corrente caricati", expanded=False):
+            movement_display = movements.sort_values("Data operazione", ascending=False).copy()
+            st.dataframe(
+                movement_display[
+                    [
+                        "Data operazione",
+                        "Data valuta",
+                        "Tipo movimento",
+                        "Entrate",
+                        "Uscite",
+                        "Importo",
+                        "Descrizione",
+                        "Descrizione completa",
+                        "Stato",
+                        "Moneymap",
+                        "Fonte",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Entrate": st.column_config.NumberColumn(format="€ %.2f"),
+                    "Uscite": st.column_config.NumberColumn(format="€ %.2f"),
+                    "Importo": st.column_config.NumberColumn(format="€ %.2f"),
+                },
+            )
 
 with tabs[6]:
     st.dataframe(
